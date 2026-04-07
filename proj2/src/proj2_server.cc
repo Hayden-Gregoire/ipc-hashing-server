@@ -11,7 +11,6 @@
 #include <unistd.h>
 #include <errno.h>
 
-#include <algorithm>
 #include <cstring>
 #include <cstddef>
 #include <cstdint>
@@ -100,16 +99,27 @@ static void *handle_request(void *arg) {
               << " num_files=" << num_files
               << " max_rows=" << max_rows << "\n";
 
-    // Deadlock prevention: solvers first, then readers.
-    // Checkout(k) waits for k slots; k cannot exceed Init pool size or we hang forever.
-    const uint32_t solver_k = std::min(max_rows, g_num_solvers);
-    const uint32_t reader_n = std::min(num_files, g_num_readers);
+    // Checkout(k) blocks until k slots exist; Process() may request more solvers
+    // internally—pool must be large enough (often >= max_rows, sometimes 2x for nested checkouts).
+    if (max_rows > g_num_solvers) {
+        std::cerr << "[worker] reject: max_rows " << max_rows << " > solver pool "
+                  << g_num_solvers << " (raise <num_solvers>)\n";
+        delete req;
+        return nullptr;
+    }
+    if (num_files > g_num_readers) {
+        std::cerr << "[worker] reject: num_files " << num_files << " > reader pool "
+                  << g_num_readers << " (raise <num_readers>)\n";
+        delete req;
+        return nullptr;
+    }
 
+    // Deadlock prevention: solvers first, then readers.
     proj2::SolverHandle solver_handle =
-        proj2::ShaSolvers::Checkout(solver_k);
+        proj2::ShaSolvers::Checkout(max_rows);
 
     proj2::ReaderHandle reader_handle =
-        proj2::FileReaders::Checkout(reader_n, &solver_handle);
+        proj2::FileReaders::Checkout(num_files, &solver_handle);
 
     std::vector<std::vector<proj2::ReaderHandle::HashType>> file_hashes;
     file_hashes.resize(num_files);
