@@ -112,6 +112,7 @@ static void *handle_request(void *arg) {
         proj2::FileReaders::Checkout(reader_n, &solver_handle);
 
     std::vector<std::vector<proj2::ReaderHandle::HashType>> file_hashes;
+    file_hashes.resize(num_files);
     reader_handle.Process(req->file_paths, req->row_counts, &file_hashes);
 
     proj2::FileReaders::Checkin(std::move(reader_handle));
