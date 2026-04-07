@@ -2,16 +2,15 @@
 // CSCE 311 Project 2 - Spring 2026
 #include "proj2/lib/sha_solver.h"
 #include "proj2/lib/file_reader.h"
+#include "proj2/lib/domain_socket.h"
 
 #include <sys/socket.h>
-#include <sys/un.h>
 #include <signal.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <errno.h>
 
 #include <cstring>
-#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -137,44 +136,21 @@ static void *handle_request(void *arg) {
     std::cerr << "[worker] sending " << result.size() << " bytes to "
               << req->reply_endpoint << "\n";
 
-    // Connect to client reply socket (abstract AF_UNIX — same as proj2-client listen)
-    int sock = ::socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sock < 0) { perror("socket"); delete req; return nullptr; }
-
-    struct sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    const std::string &ep = req->reply_endpoint;
-    const size_t plen = ep.size();
-    if (plen == 0 || plen + 1 >= sizeof(addr.sun_path)) {
-        std::cerr << "reply endpoint path empty or too long\n";
-        ::close(sock);
-        delete req;
-        return nullptr;
-    }
-    addr.sun_path[0] = '\0';
-    std::memcpy(addr.sun_path + 1, ep.data(), plen);
-    const socklen_t sun_len = static_cast<socklen_t>(
-        offsetof(struct sockaddr_un, sun_path) + 1U + plen);
-
-    if (::connect(sock,
-                  reinterpret_cast<struct sockaddr *>(&addr),
-                  sun_len) < 0) {
-        perror("connect to client reply socket");
-        ::close(sock);
-        delete req;
-        return nullptr;
-    }
+    proj2::UnixDomainStreamClient reply_sock(req->reply_endpoint);
+    reply_sock.Init();
 
     const char *ptr = result.data();
-    size_t remaining = result.size();
+    size_t       remaining = result.size();
     while (remaining > 0) {
-        ssize_t n = ::write(sock, ptr, remaining);
-        if (n <= 0) { perror("write"); break; }
-        ptr       += n;
-        remaining -= static_cast<size_t>(n);
+        std::size_t n = reply_sock.Write(ptr, remaining);
+        if (n == 0) {
+            perror("write to client reply socket");
+            break;
+        }
+        ptr += n;
+        remaining -= n;
     }
 
-    ::close(sock);
     std::cerr << "[worker] done\n";
     delete req;
     return nullptr;
@@ -214,44 +190,21 @@ int main(int argc, char *argv[]) {
     proj2::ShaSolvers::Init(g_num_solvers);
     proj2::FileReaders::Init(g_num_readers);
 
-    // Remove stale pathname socket file (e.g. old runs that used filesystem bind)
+    // Stale filesystem socket from older pathname-based runs
     ::unlink(socket_path);
 
-    // Create datagram socket
-    int server_fd = ::socket(AF_UNIX, SOCK_DGRAM, 0);
-    if (server_fd < 0) { perror("socket"); return 1; }
-
-    // Linux abstract Unix address (sun_path[0] == '\0') — must match proj2-client's sendto().
-    // Filesystem pathname bind (/tmp/...) is a different address and yields ECONNREFUSED.
-    struct sockaddr_un server_addr{};
-    server_addr.sun_family = AF_UNIX;
-    const size_t plen = std::strlen(socket_path);
-    if (plen == 0 || plen + 1 >= sizeof(server_addr.sun_path)) {
-        std::cerr << "socket_path empty or too long\n";
-        ::close(server_fd);
-        return 1;
-    }
-    server_addr.sun_path[0] = '\0';
-    std::memcpy(server_addr.sun_path + 1, socket_path, plen);
-    const socklen_t sun_len = static_cast<socklen_t>(
-        offsetof(struct sockaddr_un, sun_path) + 1U + plen);
-
-    if (::bind(server_fd,
-               reinterpret_cast<struct sockaddr *>(&server_addr),
-               sun_len) < 0) {
-        perror("bind");
-        ::close(server_fd);
-        return 1;
-    }
+    const std::string socket_path_str(socket_path);
+    proj2::UnixDomainDatagramEndpoint dgram(socket_path_str);
+    dgram.Init();
 
     std::cerr << "[server] listening (abstract AF_UNIX) @" << socket_path << "\n";
 
     const size_t BUF_SIZE = 65536;
-    char buf[BUF_SIZE];
+    char         buf[BUF_SIZE];
 
     while (!g_terminate) {
         std::cerr << "[server] waiting for datagram...\n";
-        ssize_t bytes = ::recv(server_fd, buf, BUF_SIZE, 0);
+        ssize_t bytes = ::recv(dgram.socket_fd(), buf, BUF_SIZE, 0);
 
         if (bytes < 0) {
             if (errno == EINTR) continue;
@@ -284,7 +237,6 @@ int main(int argc, char *argv[]) {
         pthread_attr_destroy(&attr);
     }
 
-    ::close(server_fd);
     ::unlink(socket_path);
     return 0;
 }
