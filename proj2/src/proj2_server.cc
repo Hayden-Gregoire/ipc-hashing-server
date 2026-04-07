@@ -2,7 +2,6 @@
 // CSCE 311 Project 2 - Spring 2026
 #include "proj2/lib/sha_solver.h"
 #include "proj2/lib/file_reader.h"
-#include "proj2/lib/domain_socket.h"
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -138,18 +137,28 @@ static void *handle_request(void *arg) {
     std::cerr << "[worker] sending " << result.size() << " bytes to "
               << req->reply_endpoint << "\n";
 
-    // Connect to client reply socket
+    // Connect to client reply socket (abstract AF_UNIX — same as proj2-client listen)
     int sock = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (sock < 0) { perror("socket"); delete req; return nullptr; }
 
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    std::strncpy(addr.sun_path, req->reply_endpoint.c_str(),
-                 sizeof(addr.sun_path) - 1);
+    const std::string &ep = req->reply_endpoint;
+    const size_t plen = ep.size();
+    if (plen == 0 || plen + 1 >= sizeof(addr.sun_path)) {
+        std::cerr << "reply endpoint path empty or too long\n";
+        ::close(sock);
+        delete req;
+        return nullptr;
+    }
+    addr.sun_path[0] = '\0';
+    std::memcpy(addr.sun_path + 1, ep.data(), plen);
+    const socklen_t sun_len = static_cast<socklen_t>(
+        offsetof(struct sockaddr_un, sun_path) + 1U + plen);
 
     if (::connect(sock,
                   reinterpret_cast<struct sockaddr *>(&addr),
-                  sizeof(addr)) < 0) {
+                  sun_len) < 0) {
         perror("connect to client reply socket");
         ::close(sock);
         delete req;
