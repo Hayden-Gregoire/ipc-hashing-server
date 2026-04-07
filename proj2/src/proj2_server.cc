@@ -7,6 +7,7 @@
 
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/stat.h>
 #include <signal.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -60,27 +61,25 @@ static bool parse_datagram(const char *buf, size_t buf_len, Request &req) {
     size_t   off = 0;
     uint32_t slen = 0;
 
-    // reply endpoint
-    if (!read_u32(buf, buf_len, off, slen))            return false;
-    if (!read_str(buf, buf_len, off, slen, req.reply_endpoint)) return false;
+    if (!read_u32(buf, buf_len, off, slen))                        return false;
+    if (!read_str(buf, buf_len, off, slen, req.reply_endpoint))    return false;
 
-    // file count
     uint32_t nfiles = 0;
-    if (!read_u32(buf, buf_len, off, nfiles))          return false;
+    if (!read_u32(buf, buf_len, off, nfiles))                      return false;
 
     req.file_paths.resize(nfiles);
     req.row_counts.resize(nfiles);
 
     for (uint32_t i = 0; i < nfiles; ++i) {
-        if (!read_u32(buf, buf_len, off, slen))                    return false;
-        if (!read_str(buf, buf_len, off, slen, req.file_paths[i])) return false;
-        if (!read_u32(buf, buf_len, off, req.row_counts[i]))       return false;
+        if (!read_u32(buf, buf_len, off, slen))                        return false;
+        if (!read_str(buf, buf_len, off, slen, req.file_paths[i]))     return false;
+        if (!read_u32(buf, buf_len, off, req.row_counts[i]))           return false;
     }
     return true;
 }
 
 // ---------------------------------------------------------------------------
-// Worker thread — one per client request
+// Worker thread
 // ---------------------------------------------------------------------------
 static void *handle_request(void *arg) {
     Request *req = static_cast<Request *>(arg);
@@ -93,43 +92,36 @@ static void *handle_request(void *arg) {
         total_rows += rc;
     }
 
-    // ------------------------------------------------------------------
-    // Deadlock prevention: always acquire solvers FIRST, then readers.
-    // This strict ordering ensures no circular wait can form.
-    // ------------------------------------------------------------------
+    std::cerr << "[worker] reply_endpoint=" << req->reply_endpoint
+              << " num_files=" << num_files
+              << " max_rows=" << max_rows << "\n";
 
-    // 1. Checkout solvers — blocks until max_rows solvers are available
+    // Deadlock prevention: solvers first, then readers
     proj2::SolverHandle solver_handle =
         proj2::ShaSolvers::Checkout(max_rows);
 
-    // 2. Checkout readers — blocks until num_files readers are available
-    //    Must already hold solver resources before calling this.
     proj2::ReaderHandle reader_handle =
         proj2::FileReaders::Checkout(num_files, &solver_handle);
 
-    // 3. Process all files at once → 2D array [file][row] of 64-byte hashes
     std::vector<std::vector<proj2::ReaderHandle::HashType>> file_hashes;
     reader_handle.Process(req->file_paths, req->row_counts, &file_hashes);
 
-    // 4. Release resources (std::move rescinds ownership)
     proj2::FileReaders::Checkin(std::move(reader_handle));
     proj2::ShaSolvers::Checkin(std::move(solver_handle));
 
-    // 5. Flatten hashes into one contiguous byte string (preserve file order)
+    // Flatten hashes
     std::string result;
     result.reserve(static_cast<size_t>(total_rows) * 64);
     for (auto &file_vec : file_hashes)
         for (auto &hash : file_vec)
             result.append(hash.data(), 64);
 
-    // 6. Connect to the client's reply stream socket and stream all hashes
-    //    Using raw POSIX here avoids any wrapper ambiguity
+    std::cerr << "[worker] sending " << result.size() << " bytes to "
+              << req->reply_endpoint << "\n";
+
+    // Connect to client reply socket
     int sock = ::socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sock < 0) {
-        perror("socket");
-        delete req;
-        return nullptr;
-    }
+    if (sock < 0) { perror("socket"); delete req; return nullptr; }
 
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
@@ -145,7 +137,6 @@ static void *handle_request(void *arg) {
         return nullptr;
     }
 
-    // Write all bytes, handling partial writes
     const char *ptr = result.data();
     size_t remaining = result.size();
     while (remaining > 0) {
@@ -156,6 +147,7 @@ static void *handle_request(void *arg) {
     }
 
     ::close(sock);
+    std::cerr << "[worker] done\n";
     delete req;
     return nullptr;
 }
@@ -179,7 +171,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Signal handlers — only set flag, no unsafe ops
+    // Signal handlers
     struct sigaction sa{};
     sa.sa_handler = signal_handler;
     sigemptyset(&sa.sa_mask);
@@ -187,13 +179,14 @@ int main(int argc, char *argv[]) {
     sigaction(SIGINT,  &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
-    // Initialize resource pools exactly once
+    // Initialize resource pools
     proj2::ShaSolvers::Init(static_cast<uint32_t>(num_solvers));
     proj2::FileReaders::Init(static_cast<uint32_t>(num_readers));
 
-    // Create and bind server datagram socket using raw POSIX
-    ::unlink(socket_path);  // remove stale socket file if present
+    // Remove stale socket
+    ::unlink(socket_path);
 
+    // Create datagram socket
     int server_fd = ::socket(AF_UNIX, SOCK_DGRAM, 0);
     if (server_fd < 0) { perror("socket"); return 1; }
 
@@ -210,21 +203,31 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Main receive loop
+    // Verify socket type after bind
+    struct stat st;
+    if (::stat(socket_path, &st) == 0) {
+        std::cerr << "[server] bound to " << socket_path
+                  << " (is socket: " << S_ISSOCK(st.st_mode) << ")\n";
+    }
+
+    std::cerr << "[server] listening for datagrams on " << socket_path << "\n";
+
     const size_t BUF_SIZE = 65536;
     char buf[BUF_SIZE];
 
     while (!g_terminate) {
+        std::cerr << "[server] waiting for datagram...\n";
         ssize_t bytes = ::recv(server_fd, buf, BUF_SIZE, 0);
 
         if (bytes < 0) {
-            if (errno == EINTR) continue;  // interrupted by signal, check flag
+            if (errno == EINTR) continue;
             perror("recv");
             continue;
         }
         if (bytes == 0) continue;
 
-        // Parse datagram into a Request
+        std::cerr << "[server] received datagram of " << bytes << " bytes\n";
+
         Request *req = new Request();
         if (!parse_datagram(buf, static_cast<size_t>(bytes), *req)) {
             std::cerr << "Failed to parse datagram (" << bytes << " bytes)\n";
@@ -232,7 +235,9 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        // Spawn a detached thread to handle this request
+        std::cerr << "[server] parsed request: reply=" << req->reply_endpoint
+                  << " files=" << req->file_paths.size() << "\n";
+
         pthread_t tid;
         pthread_attr_t attr;
         pthread_attr_init(&attr);
