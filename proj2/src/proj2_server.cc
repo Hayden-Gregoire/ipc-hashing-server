@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <errno.h>
 
+#include <algorithm>
 #include <cstring>
 #include <cstddef>
 #include <cstdint>
@@ -23,6 +24,10 @@
 // Termination flag — set only inside signal handler
 // ---------------------------------------------------------------------------
 static volatile sig_atomic_t g_terminate = 0;
+
+// Pool sizes from argv (Init); Checkout must not exceed these or it blocks forever.
+static uint32_t g_num_solvers = 0;
+static uint32_t g_num_readers = 0;
 
 static void signal_handler(int /*sig*/) {
     g_terminate = 1;
@@ -95,12 +100,16 @@ static void *handle_request(void *arg) {
               << " num_files=" << num_files
               << " max_rows=" << max_rows << "\n";
 
-    // Deadlock prevention: solvers first, then readers
+    // Deadlock prevention: solvers first, then readers.
+    // Checkout(k) waits for k slots; k cannot exceed Init pool size or we hang forever.
+    const uint32_t solver_k = std::min(max_rows, g_num_solvers);
+    const uint32_t reader_n = std::min(num_files, g_num_readers);
+
     proj2::SolverHandle solver_handle =
-        proj2::ShaSolvers::Checkout(max_rows);
+        proj2::ShaSolvers::Checkout(solver_k);
 
     proj2::ReaderHandle reader_handle =
-        proj2::FileReaders::Checkout(num_files, &solver_handle);
+        proj2::FileReaders::Checkout(reader_n, &solver_handle);
 
     std::vector<std::vector<proj2::ReaderHandle::HashType>> file_hashes;
     reader_handle.Process(req->file_paths, req->row_counts, &file_hashes);
@@ -178,9 +187,12 @@ int main(int argc, char *argv[]) {
     sigaction(SIGINT,  &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
+    g_num_solvers = static_cast<uint32_t>(num_solvers);
+    g_num_readers = static_cast<uint32_t>(num_readers);
+
     // Initialize resource pools
-    proj2::ShaSolvers::Init(static_cast<uint32_t>(num_solvers));
-    proj2::FileReaders::Init(static_cast<uint32_t>(num_readers));
+    proj2::ShaSolvers::Init(g_num_solvers);
+    proj2::FileReaders::Init(g_num_readers);
 
     // Remove stale pathname socket file (e.g. old runs that used filesystem bind)
     ::unlink(socket_path);
