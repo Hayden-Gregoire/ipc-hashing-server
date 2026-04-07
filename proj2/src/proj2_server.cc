@@ -1,19 +1,18 @@
 // proj2_server.cc
 // CSCE 311 Project 2 - Spring 2026
-
 #include "proj2/lib/sha_solver.h"
 #include "proj2/lib/file_reader.h"
 #include "proj2/lib/domain_socket.h"
 
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <sys/stat.h>
 #include <signal.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <errno.h>
 
 #include <cstring>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -183,34 +182,37 @@ int main(int argc, char *argv[]) {
     proj2::ShaSolvers::Init(static_cast<uint32_t>(num_solvers));
     proj2::FileReaders::Init(static_cast<uint32_t>(num_readers));
 
-    // Remove stale socket
+    // Remove stale pathname socket file (e.g. old runs that used filesystem bind)
     ::unlink(socket_path);
 
     // Create datagram socket
     int server_fd = ::socket(AF_UNIX, SOCK_DGRAM, 0);
     if (server_fd < 0) { perror("socket"); return 1; }
 
+    // Linux abstract Unix address (sun_path[0] == '\0') — must match proj2-client's sendto().
+    // Filesystem pathname bind (/tmp/...) is a different address and yields ECONNREFUSED.
     struct sockaddr_un server_addr{};
     server_addr.sun_family = AF_UNIX;
-    std::strncpy(server_addr.sun_path, socket_path,
-                 sizeof(server_addr.sun_path) - 1);
+    const size_t plen = std::strlen(socket_path);
+    if (plen == 0 || plen + 1 >= sizeof(server_addr.sun_path)) {
+        std::cerr << "socket_path empty or too long\n";
+        ::close(server_fd);
+        return 1;
+    }
+    server_addr.sun_path[0] = '\0';
+    std::memcpy(server_addr.sun_path + 1, socket_path, plen);
+    const socklen_t sun_len = static_cast<socklen_t>(
+        offsetof(struct sockaddr_un, sun_path) + 1U + plen);
 
     if (::bind(server_fd,
                reinterpret_cast<struct sockaddr *>(&server_addr),
-               sizeof(server_addr)) < 0) {
+               sun_len) < 0) {
         perror("bind");
         ::close(server_fd);
         return 1;
     }
 
-    // Verify socket type after bind
-    struct stat st;
-    if (::stat(socket_path, &st) == 0) {
-        std::cerr << "[server] bound to " << socket_path
-                  << " (is socket: " << S_ISSOCK(st.st_mode) << ")\n";
-    }
-
-    std::cerr << "[server] listening for datagrams on " << socket_path << "\n";
+    std::cerr << "[server] listening (abstract AF_UNIX) @" << socket_path << "\n";
 
     const size_t BUF_SIZE = 65536;
     char buf[BUF_SIZE];

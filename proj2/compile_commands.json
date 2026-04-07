@@ -1,0 +1,26 @@
+[
+  {
+    "directory": "/Users/haydengregoire/Documents/CSCE-311-Proj2/proj2",
+    "arguments": [
+      "g++",
+      "-std=c++20",
+      "-Wall",
+      "-Wextra",
+      "-pedantic",
+      "-g",
+      "-Iinclude",
+      "-Ilib/include",
+      "-I..",
+      "-pthread",
+      "-MMD",
+      "-MP",
+      "-MF",
+      "build/proj2_server.d",
+      "-c",
+      "-o",
+      "build/proj2_server.o",
+      "src/proj2_server.cc"
+    ],
+    "file": "src/proj2_server.cc"
+  }
+]
