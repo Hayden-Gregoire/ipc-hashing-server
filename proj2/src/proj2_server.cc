@@ -4,13 +4,13 @@
 #include "proj2/lib/sha_solver.h"
 #include "proj2/lib/file_reader.h"
 #include "proj2/lib/domain_socket.h"
-#include "proj2/lib/thread_log.h"
 
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <signal.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <errno.h>
 
 #include <cstring>
 #include <cstdint>
@@ -18,10 +18,9 @@
 #include <iostream>
 #include <string>
 #include <vector>
-#include <algorithm>
 
 // ---------------------------------------------------------------------------
-// Termination flag
+// Termination flag — set only inside signal handler
 // ---------------------------------------------------------------------------
 static volatile sig_atomic_t g_terminate = 0;
 
@@ -39,49 +38,49 @@ struct Request {
 };
 
 // ---------------------------------------------------------------------------
-// Binary protocol parsing helpers
+// Binary protocol parsing
 // ---------------------------------------------------------------------------
-static bool read_u32(const char *buf, size_t buf_len, size_t &offset,
+static bool read_u32(const char *buf, size_t buf_len, size_t &off,
                      uint32_t &out) {
-    if (offset + 4 > buf_len) return false;
-    std::memcpy(&out, buf + offset, 4);
-    offset += 4;
+    if (off + 4 > buf_len) return false;
+    std::memcpy(&out, buf + off, 4);
+    off += 4;
     return true;
 }
 
-static bool read_string(const char *buf, size_t buf_len, size_t &offset,
-                        uint32_t len, std::string &out) {
-    if (offset + len > buf_len) return false;
-    out.assign(buf + offset, len);
-    offset += len;
+static bool read_str(const char *buf, size_t buf_len, size_t &off,
+                     uint32_t len, std::string &out) {
+    if (off + len > buf_len) return false;
+    out.assign(buf + off, len);
+    off += len;
     return true;
 }
 
 static bool parse_datagram(const char *buf, size_t buf_len, Request &req) {
-    size_t   offset = 0;
-    uint32_t tmp_len = 0;
+    size_t   off = 0;
+    uint32_t slen = 0;
 
-    if (!read_u32(buf, buf_len, offset, tmp_len)) return false;
-    if (!read_string(buf, buf_len, offset, tmp_len, req.reply_endpoint))
-        return false;
+    // reply endpoint
+    if (!read_u32(buf, buf_len, off, slen))            return false;
+    if (!read_str(buf, buf_len, off, slen, req.reply_endpoint)) return false;
 
-    uint32_t file_count = 0;
-    if (!read_u32(buf, buf_len, offset, file_count)) return false;
+    // file count
+    uint32_t nfiles = 0;
+    if (!read_u32(buf, buf_len, off, nfiles))          return false;
 
-    req.file_paths.resize(file_count);
-    req.row_counts.resize(file_count);
+    req.file_paths.resize(nfiles);
+    req.row_counts.resize(nfiles);
 
-    for (uint32_t i = 0; i < file_count; ++i) {
-        if (!read_u32(buf, buf_len, offset, tmp_len)) return false;
-        if (!read_string(buf, buf_len, offset, tmp_len, req.file_paths[i]))
-            return false;
-        if (!read_u32(buf, buf_len, offset, req.row_counts[i])) return false;
+    for (uint32_t i = 0; i < nfiles; ++i) {
+        if (!read_u32(buf, buf_len, off, slen))                    return false;
+        if (!read_str(buf, buf_len, off, slen, req.file_paths[i])) return false;
+        if (!read_u32(buf, buf_len, off, req.row_counts[i]))       return false;
     }
     return true;
 }
 
 // ---------------------------------------------------------------------------
-// Worker thread
+// Worker thread — one per client request
 // ---------------------------------------------------------------------------
 static void *handle_request(void *arg) {
     Request *req = static_cast<Request *>(arg);
@@ -95,41 +94,68 @@ static void *handle_request(void *arg) {
     }
 
     // ------------------------------------------------------------------
-    // Deadlock prevention:
-    //   Always acquire solvers FIRST (max row count across all files),
-    //   then acquire readers. This strict ordering prevents circular waits.
+    // Deadlock prevention: always acquire solvers FIRST, then readers.
+    // This strict ordering ensures no circular wait can form.
     // ------------------------------------------------------------------
 
-    // 1. Checkout solvers (blocks until max_rows solvers are free)
-    proj2::SolverHandle solver_handle = proj2::ShaSolvers::Checkout(max_rows);
+    // 1. Checkout solvers — blocks until max_rows solvers are available
+    proj2::SolverHandle solver_handle =
+        proj2::ShaSolvers::Checkout(max_rows);
 
-    // 2. Checkout readers (blocks until num_files readers are free)
-    //    Pass a pointer to the already-held solver handle.
+    // 2. Checkout readers — blocks until num_files readers are available
+    //    Must already hold solver resources before calling this.
     proj2::ReaderHandle reader_handle =
         proj2::FileReaders::Checkout(num_files, &solver_handle);
 
-    // 3. Process all files — result is a 2D vector: [file][row] = 64-char hash
+    // 3. Process all files at once → 2D array [file][row] of 64-byte hashes
     std::vector<std::vector<proj2::ReaderHandle::HashType>> file_hashes;
     reader_handle.Process(req->file_paths, req->row_counts, &file_hashes);
 
-    // 4. Release readers then solvers (std::move rescinds ownership)
+    // 4. Release resources (std::move rescinds ownership)
     proj2::FileReaders::Checkin(std::move(reader_handle));
     proj2::ShaSolvers::Checkin(std::move(solver_handle));
 
-    // 5. Flatten into one contiguous byte string, ordered by file
+    // 5. Flatten hashes into one contiguous byte string (preserve file order)
     std::string result;
-    result.reserve(total_rows * 64);
-    for (auto &file_vec : file_hashes) {
-        for (auto &hash : file_vec) {
+    result.reserve(static_cast<size_t>(total_rows) * 64);
+    for (auto &file_vec : file_hashes)
+        for (auto &hash : file_vec)
             result.append(hash.data(), 64);
-        }
+
+    // 6. Connect to the client's reply stream socket and stream all hashes
+    //    Using raw POSIX here avoids any wrapper ambiguity
+    int sock = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock < 0) {
+        perror("socket");
+        delete req;
+        return nullptr;
     }
 
-    // 6. Connect back to client's reply stream socket and send all hashes
-    proj2::UnixDomainStreamClient client(req->reply_endpoint);
-    client.Init();  // connect
-    client.Write(result.data(), result.size());
+    struct sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, req->reply_endpoint.c_str(),
+                 sizeof(addr.sun_path) - 1);
 
+    if (::connect(sock,
+                  reinterpret_cast<struct sockaddr *>(&addr),
+                  sizeof(addr)) < 0) {
+        perror("connect to client reply socket");
+        ::close(sock);
+        delete req;
+        return nullptr;
+    }
+
+    // Write all bytes, handling partial writes
+    const char *ptr = result.data();
+    size_t remaining = result.size();
+    while (remaining > 0) {
+        ssize_t n = ::write(sock, ptr, remaining);
+        if (n <= 0) { perror("write"); break; }
+        ptr       += n;
+        remaining -= static_cast<size_t>(n);
+    }
+
+    ::close(sock);
     delete req;
     return nullptr;
 }
@@ -153,7 +179,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Install signal handlers — no unsafe ops inside the handler
+    // Signal handlers — only set flag, no unsafe ops
     struct sigaction sa{};
     sa.sa_handler = signal_handler;
     sigemptyset(&sa.sa_mask);
@@ -161,33 +187,52 @@ int main(int argc, char *argv[]) {
     sigaction(SIGINT,  &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
-    // Initialize resource pools exactly once at startup
+    // Initialize resource pools exactly once
     proj2::ShaSolvers::Init(static_cast<uint32_t>(num_solvers));
     proj2::FileReaders::Init(static_cast<uint32_t>(num_readers));
 
-    // Bind the server datagram socket
-    proj2::UnixDomainDatagramEndpoint server(socket_path);
-    server.Init();
+    // Create and bind server datagram socket using raw POSIX
+    ::unlink(socket_path);  // remove stale socket file if present
 
+    int server_fd = ::socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (server_fd < 0) { perror("socket"); return 1; }
+
+    struct sockaddr_un server_addr{};
+    server_addr.sun_family = AF_UNIX;
+    std::strncpy(server_addr.sun_path, socket_path,
+                 sizeof(server_addr.sun_path) - 1);
+
+    if (::bind(server_fd,
+               reinterpret_cast<struct sockaddr *>(&server_addr),
+               sizeof(server_addr)) < 0) {
+        perror("bind");
+        ::close(server_fd);
+        return 1;
+    }
+
+    // Main receive loop
     const size_t BUF_SIZE = 65536;
+    char buf[BUF_SIZE];
 
     while (!g_terminate) {
-        std::string peer_path;
-        std::string datagram = server.RecvFrom(&peer_path, BUF_SIZE);
+        ssize_t bytes = ::recv(server_fd, buf, BUF_SIZE, 0);
 
-        if (datagram.empty()) {
-            if (g_terminate) break;
+        if (bytes < 0) {
+            if (errno == EINTR) continue;  // interrupted by signal, check flag
+            perror("recv");
             continue;
         }
+        if (bytes == 0) continue;
 
+        // Parse datagram into a Request
         Request *req = new Request();
-        if (!parse_datagram(datagram.data(), datagram.size(), *req)) {
-            std::cerr << "Failed to parse datagram\n";
+        if (!parse_datagram(buf, static_cast<size_t>(bytes), *req)) {
+            std::cerr << "Failed to parse datagram (" << bytes << " bytes)\n";
             delete req;
             continue;
         }
 
-        // Spawn a detached thread per request
+        // Spawn a detached thread to handle this request
         pthread_t tid;
         pthread_attr_t attr;
         pthread_attr_init(&attr);
@@ -200,5 +245,7 @@ int main(int argc, char *argv[]) {
         pthread_attr_destroy(&attr);
     }
 
+    ::close(server_fd);
+    ::unlink(socket_path);
     return 0;
 }
