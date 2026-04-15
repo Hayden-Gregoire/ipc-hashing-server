@@ -1,4 +1,4 @@
-// Copyright 2026 CSCE 311 Project 2
+// Copyright Haydencg
 //
 // Local IPC server: datagram requests, worker threads, pooled readers/solvers,
 // stream reply of concatenated 64-byte ASCII hashes.
@@ -23,9 +23,9 @@
 #include <utility>
 #include <vector>
 
-#include "proj2/lib/domain_socket.h"
-#include "proj2/lib/file_reader.h"
-#include "proj2/lib/sha_solver.h"
+#include "../lib/domain_socket.h"
+#include "../lib/file_reader.h"
+#include "../lib/sha_solver.h"
 
 // Set only from the SIGINT/SIGTERM handler (async-signal-safe).
 static volatile sig_atomic_t g_terminate = 0;

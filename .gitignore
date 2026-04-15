@@ -1,0 +1,9 @@
+build/
+bin/
+.cache/
+*.zip
+
+# Common local/build artifacts
+.DS_Store
+*.o
+*.d
