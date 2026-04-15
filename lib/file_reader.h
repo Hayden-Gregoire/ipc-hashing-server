@@ -3,7 +3,7 @@
 #ifndef PROJ2_LIB_FILE_READER_H_
 #define PROJ2_LIB_FILE_READER_H_
 
-#include "proj2/lib/sha_solver.h"
+#include "sha_solver.h"
 
 #include <array>
 #include <cstddef>
